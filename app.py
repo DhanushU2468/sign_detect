@@ -1,93 +1,121 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, VideoProcessorBase
-import cv2
+from streamlit_webrtc import (
+    webrtc_streamer,
+    WebRtcMode,
+    RTCConfiguration,
+    VideoProcessorBase,
+)
 import numpy as np
 import pyttsx3
 import threading
 import av
 from ultralytics import YOLO
+from PIL import Image, ImageDraw, ImageFont
 
 from gesture_utils import classify_gesture
 
 
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(page_title="YOLO Hand Pose + Voice", layout="wide")
-st.title("🖐 Live Hand Gesture Detection + Voice Output (YOLO Pose)")
-st.write("Works on Streamlit Cloud (NO Mediapipe).")
+st.title("🖐 Live Hand Gesture Detection + Voice Output (YOLO Pose, no OpenCV)")
+st.write(
+    "This version uses **YOLO pose + PIL** (no OpenCV / no MediaPipe), "
+    "so it is compatible with Streamlit Cloud (Python 3.13)."
+)
 
 
 # ---------------- YOLO MODEL ----------------
 @st.cache_resource
 def load_yolo():
-    return YOLO("yolov8n-pose.pt")   # Auto-downloads
+    # yolov8n-pose.pt will auto-download if not present
+    return YOLO("yolov8n-pose.pt")
 
 model = load_yolo()
 
 
 # ---------------- VIDEO PROCESSOR ----------------
 class HandPoseProcessor(VideoProcessorBase):
-
     def __init__(self):
         self.last_spoken = None
 
+    # ----- NON-BLOCKING VOICE -----
     def speak_async(self, text):
-
-        def speech():
+        def speech_job():
             engine = pyttsx3.init()
             engine.setProperty("rate", 150)
             engine.say(text)
             engine.runAndWait()
             engine.stop()
 
-        threading.Thread(target=speech, daemon=True).start()
+        threading.Thread(target=speech_job, daemon=True).start()
 
-    def recv(self, frame):
+    # ----- FRAME PROCESSING -----
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        # Get frame as RGB numpy array
+        img_rgb = frame.to_ndarray(format="rgb24")
 
-        img = frame.to_ndarray(format="bgr24")
+        # Run YOLO pose model
+        results = model(img_rgb, verbose=False)
 
-        # Run YOLO pose
-        results = model(img, verbose=False)
-
+        # Convert numpy to PIL for drawing
+        pil_img = Image.fromarray(img_rgb)
+        draw = ImageDraw.Draw(pil_img)
         gesture = None
 
         for result in results:
-            if result.keypoints is not None:
+            if result.keypoints is None:
+                continue
 
-                kpts = result.keypoints.xy.cpu().numpy()[0]  # shape (21,2)
+            # keypoints.xy: (num_objects, num_kpts, 2)
+            kpts_xy = result.keypoints.xy
+            if kpts_xy is None or len(kpts_xy) == 0:
+                continue
 
-                # Convert single keypoints array to (21,3)
-                kpts_full = np.zeros((21, 3))
-                for i, p in enumerate(kpts):
-                    kpts_full[i] = [p[0], p[1], 1]
+            # For simplicity, take the first detected object
+            kpts = kpts_xy[0].cpu().numpy()  # shape (K, 2)
+            num_kpts = kpts.shape[0]
 
-                # Draw keypoints
-                for (x, y, conf) in kpts_full:
-                    cv2.circle(img, (int(x), int(y)), 4, (0, 255, 0), -1)
+            # Build (K, 3) array: x, y, conf (dummy 1.0)
+            kpts_full = np.zeros((num_kpts, 3), dtype=float)
+            for i, (x, y) in enumerate(kpts):
+                kpts_full[i] = [x, y, 1.0]
+                # Minimal drawing: small green circle
+                r = 3
+                draw.ellipse(
+                    (x - r, y - r, x + r, y + r),
+                    fill=(0, 255, 0),
+                    outline=None,
+                )
 
-                # Gesture
+            # Classify gesture from keypoints
+            if num_kpts >= 21:
+                # If your model has 21 keypoints (hand pose)
                 gesture = classify_gesture(kpts_full)
+            else:
+                # If using body-pose model (17 kpts), you may want a different logic
+                gesture = None
 
-        # Speak voice
+        # Voice and text overlay
         if gesture and gesture != self.last_spoken:
             self.speak_async(gesture)
             self.last_spoken = gesture
 
-        # Display gesture
         if gesture:
-            cv2.putText(img, gesture, (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2,
-                        (255, 0, 0), 3)
+            # Draw gesture label at top-left
+            draw.text((20, 20), gesture, fill=(255, 0, 0))
 
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+        # Back to numpy
+        out_frame = np.array(pil_img)
+        return av.VideoFrame.from_ndarray(out_frame, format="rgb24")
 
 
-# ---------------- WEBRTC ----------------
+# ---------------- WEBRTC CONFIG ----------------
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
 webrtc_streamer(
-    key="yolo-hand-voice",
+    key="yolo-hand-voice-no-opencv",
     mode=WebRtcMode.SENDRECV,
     rtc_configuration=RTC_CONFIGURATION,
     media_stream_constraints={"video": True, "audio": False},
