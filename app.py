@@ -28,7 +28,7 @@ st.write(
 
 
 # ---------------- MODEL LOADING ----------------
-MODEL_PATH = "hand_landmark.onnx"
+MODEL_PATH = "hand_landmark_sparse_Nx3x224x224.onnx"
 ONNX_URL = (
     "https://github.com/PINTO0309/PINTO_model_zoo/"
     "raw/main/033_mediapipe_hand_landmark/hand_landmark_3d.onnx"
