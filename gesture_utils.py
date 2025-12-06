@@ -1,53 +1,56 @@
 import math
+import numpy as np
 
+def classify_gesture(kpts):
+    """
+    kpts = 21-keypoint array of shape (21,3) from YOLO pose
+    Each keypoint: [x, y, confidence]
+    """
 
-def classify_gesture(hand_landmarks):
-    lm = hand_landmarks.landmark
+    # Landmarks mapping (YOLO hand model)
+    # Index reference same as MediaPipe:
+    # 0: wrist, 4: thumb tip, 8: index tip, etc.
 
-    # Helper to check finger up/down
-    def finger_up(tip, pip):
-        return lm[tip].y < lm[pip].y
+    def up(tip, pip):
+        return kpts[tip][1] < kpts[pip][1]
 
-    # FINGER STATES
-    thumb_up = lm[4].y < lm[3].y
-    thumb_down = lm[4].y > lm[3].y
-    index_up = finger_up(8, 6)
-    middle_up = finger_up(12, 10)
-    ring_up = finger_up(16, 14)
-    pinky_up = finger_up(20, 18)
+    thumb_up = up(4, 3)
+    thumb_down = kpts[4][1] > kpts[3][1]
+    index_up = up(8, 6)
+    middle_up = up(12, 10)
+    ring_up = up(16, 14)
+    pinky_up = up(20, 18)
 
-    fingers = [thumb_up, index_up, middle_up, ring_up, pinky_up]
-
-    # ---- 1. STOP ✋ (all fingers up)
+    # STOP ✋
     if index_up and middle_up and ring_up and pinky_up:
         return "STOP"
 
-    # ---- 2. THUMBS UP 👍
-    if thumb_up and not index_up and not middle_up:
+    # THUMBS UP 👍
+    if thumb_up and not index_up:
         return "THUMBS UP"
 
-    # ---- 3. THUMBS DOWN 👎
-    if thumb_down and not index_up and not middle_up:
+    # THUMBS DOWN 👎
+    if thumb_down and not index_up:
         return "THUMBS DOWN"
 
-    # ---- 4. OK 👌
-    dist_ok = math.dist((lm[4].x, lm[4].y), (lm[8].x, lm[8].y))
-    if dist_ok < 0.05:
+    # OK 👌
+    dist_ok = math.dist(kpts[4][:2], kpts[8][:2])
+    if dist_ok < 25:
         return "OK"
 
-    # ---- 5. PEACE ✌️ (index + middle up)
+    # PEACE ✌️
     if index_up and middle_up and not ring_up and not pinky_up:
         return "PEACE"
 
-    # ---- 6. ROCK 🤘 (index + pinky up)
+    # ROCK 🤘
     if index_up and pinky_up and not middle_up:
         return "ROCK"
 
-    # ---- 7. FIST ✊ (all fingers down)
+    # FIST ✊
     if not index_up and not middle_up and not ring_up and not pinky_up:
         return "FIST"
 
-    # ---- 8. OPEN PALM 🖐️ (4 fingers up, thumb neutral)
+    # OPEN PALM
     if index_up and middle_up and ring_up and pinky_up and thumb_up:
         return "OPEN PALM"
 
