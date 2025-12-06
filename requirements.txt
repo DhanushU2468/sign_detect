@@ -1,7 +1,8 @@
 streamlit
 streamlit-webrtc
-ultralytics
+onnxruntime
 numpy
+Pillow
 pyttsx3
 av
-Pillow
+requests
