@@ -1,111 +1,151 @@
-import streamlit as st
-from streamlit_webrtc import (
-    webrtc_streamer,
-    WebRtcMode,
-    RTCConfiguration,
-    VideoProcessorBase,
-)
-import numpy as np
-import pyttsx3
+import os
 import threading
+
 import av
-from ultralytics import YOLO
-from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import onnxruntime as ort
+import pyttsx3
+import requests
+import streamlit as st
+from PIL import Image, ImageDraw
+from streamlit_webrtc import (
+    RTCConfiguration,
+    WebRtcMode,
+    VideoProcessorBase,
+    webrtc_streamer,
+)
 
 from gesture_utils import classify_gesture
 
 
 # ---------------- STREAMLIT UI ----------------
-st.set_page_config(page_title="YOLO Hand Pose + Voice", layout="wide")
-st.title("🖐 Live Hand Gesture Detection + Voice Output (YOLO Pose, no OpenCV)")
+st.set_page_config(page_title="Hand Gesture + Voice (ONNX)", layout="wide")
+st.title("🖐 Live Hand Gesture Detection + Voice (ONNX, Cloud-Safe)")
 st.write(
-    "This version uses **YOLO pose + PIL** (no OpenCV / no MediaPipe), "
-    "so it is compatible with Streamlit Cloud (Python 3.13)."
+    "Runs a MediaPipe-style hand landmark ONNX model with **onnxruntime + PIL** "
+    "(no OpenCV, no MediaPipe, no YOLO), so it works on Streamlit Cloud."
 )
 
 
-# ---------------- YOLO MODEL ----------------
-@st.cache_resource
-def load_yolo():
-    # yolov8n-pose.pt will auto-download if not present
-    return YOLO("yolov8n-pose.pt")
+# ---------------- MODEL LOADING ----------------
+MODEL_PATH = "hand_landmark.onnx"
+ONNX_URL = (
+    "https://github.com/PINTO0309/PINTO_model_zoo/"
+    "raw/main/033_mediapipe_hand_landmark/hand_landmark_3d.onnx"
+)
+INPUT_SIZE = 256  # model expects 256x256 RGB
 
-model = load_yolo()
+
+@st.cache_resource
+def load_onnx_session():
+    # Try to download model if not present
+    if not os.path.exists(MODEL_PATH):
+        try:
+            st.info("Downloading ONNX hand landmark model...")
+            r = requests.get(ONNX_URL, timeout=15)
+            r.raise_for_status()
+            with open(MODEL_PATH, "wb") as f:
+                f.write(r.content)
+            st.success("Model downloaded successfully.")
+        except Exception as e:
+            st.error(
+                "Could not download hand_landmark.onnx automatically.\n"
+                "Please download it manually from PINTO_model_zoo "
+                "-> 033_mediapipe_hand_landmark, rename to 'hand_landmark.onnx' "
+                "and place it in the app folder.\n\n"
+                f"Error: {e}"
+            )
+            raise
+
+    sess = ort.InferenceSession(
+        MODEL_PATH,
+        providers=["CPUExecutionProvider"],
+    )
+    input_name = sess.get_inputs()[0].name
+    return sess, input_name
+
+
+onnx_sess, onnx_input_name = load_onnx_session()
+
+
+def run_hand_landmark(rgb_frame: np.ndarray) -> np.ndarray | None:
+    """
+    rgb_frame: (H, W, 3) uint8
+    Returns: (21, 3) landmarks in normalized coords (0-1), or None.
+    """
+    # Resize to model input (256x256)
+    pil_img = Image.fromarray(rgb_frame)
+    pil_resized = pil_img.resize((INPUT_SIZE, INPUT_SIZE))
+    img_np = np.asarray(pil_resized).astype(np.float32) / 255.0  # [0,1]
+    img_np = img_np[np.newaxis, ...]  # (1, 256, 256, 3)
+
+    outputs = onnx_sess.run(None, {onnx_input_name: img_np})
+    if len(outputs) == 0:
+        return None
+
+    # Assume first output is (1, 63) -> 21*3
+    lm = outputs[0].reshape(-1, 3)  # (21,3)
+    if lm.shape[0] < 21:
+        return None
+
+    return lm  # normalized coords in model space
 
 
 # ---------------- VIDEO PROCESSOR ----------------
-class HandPoseProcessor(VideoProcessorBase):
+class HandGestureProcessor(VideoProcessorBase):
     def __init__(self):
         self.last_spoken = None
 
-    # ----- NON-BLOCKING VOICE -----
-    def speak_async(self, text):
-        def speech_job():
-            engine = pyttsx3.init()
-            engine.setProperty("rate", 150)
-            engine.say(text)
-            engine.runAndWait()
-            engine.stop()
+    def speak_async(self, text: str):
+        """Speak text in a background thread. On cloud you won't hear it,
+        but locally this will work."""
+        def worker():
+            try:
+                engine = pyttsx3.init()
+                engine.setProperty("rate", 150)
+                engine.say(text)
+                engine.runAndWait()
+                engine.stop()
+            except Exception:
+                # On Streamlit Cloud audio may not be available – fail silently
+                pass
 
-        threading.Thread(target=speech_job, daemon=True).start()
+        threading.Thread(target=worker, daemon=True).start()
 
-    # ----- FRAME PROCESSING -----
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        # Get frame as RGB numpy array
+        # Get frame as RGB
         img_rgb = frame.to_ndarray(format="rgb24")
 
-        # Run YOLO pose model
-        results = model(img_rgb, verbose=False)
-
-        # Convert numpy to PIL for drawing
-        pil_img = Image.fromarray(img_rgb)
-        draw = ImageDraw.Draw(pil_img)
+        # Run ONNX landmark model
+        landmarks = run_hand_landmark(img_rgb)
         gesture = None
 
-        for result in results:
-            if result.keypoints is None:
-                continue
+        # Work on a 256x256 image for drawing (same as model input)
+        pil_out = Image.fromarray(img_rgb).resize((INPUT_SIZE, INPUT_SIZE))
+        draw = ImageDraw.Draw(pil_out)
 
-            # keypoints.xy: (num_objects, num_kpts, 2)
-            kpts_xy = result.keypoints.xy
-            if kpts_xy is None or len(kpts_xy) == 0:
-                continue
-
-            # For simplicity, take the first detected object
-            kpts = kpts_xy[0].cpu().numpy()  # shape (K, 2)
-            num_kpts = kpts.shape[0]
-
-            # Build (K, 3) array: x, y, conf (dummy 1.0)
-            kpts_full = np.zeros((num_kpts, 3), dtype=float)
-            for i, (x, y) in enumerate(kpts):
-                kpts_full[i] = [x, y, 1.0]
-                # Minimal drawing: small green circle
+        if landmarks is not None:
+            # Draw minimal green dots for 21 keypoints
+            for x_norm, y_norm, _ in landmarks:
+                x = float(x_norm) * INPUT_SIZE
+                y = float(y_norm) * INPUT_SIZE
                 r = 3
-                draw.ellipse(
-                    (x - r, y - r, x + r, y + r),
-                    fill=(0, 255, 0),
-                    outline=None,
-                )
+                draw.ellipse((x - r, y - r, x + r, y + r), fill=(0, 255, 0))
 
-            # Classify gesture from keypoints
-            if num_kpts >= 21:
-                # If your model has 21 keypoints (hand pose)
-                gesture = classify_gesture(kpts_full)
-            else:
-                # If using body-pose model (17 kpts), you may want a different logic
-                gesture = None
+            # Classify gesture in normalized model space
+            gesture = classify_gesture(landmarks)
 
-        # Voice and text overlay
+        # Voice: speak only when gesture changes
         if gesture and gesture != self.last_spoken:
             self.speak_async(gesture)
             self.last_spoken = gesture
 
+        # Display label
         if gesture:
-            # Draw gesture label at top-left
-            draw.text((20, 20), gesture, fill=(255, 0, 0))
+            draw.text((10, 10), gesture, fill=(255, 0, 0))
 
-        # Back to numpy
-        out_frame = np.array(pil_img)
+        # Back to numpy for WebRTC
+        out_frame = np.array(pil_out)
         return av.VideoFrame.from_ndarray(out_frame, format="rgb24")
 
 
@@ -115,10 +155,10 @@ RTC_CONFIGURATION = RTCConfiguration(
 )
 
 webrtc_streamer(
-    key="yolo-hand-voice-no-opencv",
+    key="onnx-hand-gesture-voice",
     mode=WebRtcMode.SENDRECV,
     rtc_configuration=RTC_CONFIGURATION,
     media_stream_constraints={"video": True, "audio": False},
-    video_processor_factory=HandPoseProcessor,
+    video_processor_factory=HandGestureProcessor,
     async_processing=True,
 )
